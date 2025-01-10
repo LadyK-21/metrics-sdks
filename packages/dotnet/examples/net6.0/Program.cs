@@ -16,8 +16,7 @@ builder.Host.ConfigureAppConfiguration((hostingContext, config) =>
 
 var app = builder.Build();
 
-var port = Environment.GetEnvironmentVariable("PORT");
-if (string.IsNullOrEmpty(port)) port = "4000";
+var port = Environment.GetEnvironmentVariable("PORT") ?? "8000";
 
 app.Use(async (context, next) =>
 {
@@ -28,11 +27,17 @@ app.Use(async (context, next) =>
   await next();
 });
 
-app.UseMiddleware<Readme.Metrics>();
+app.UseMiddleware<ReadMe.Metrics>();
 
 app.MapGet("/", async context =>
 {
   await context.Response.WriteAsJsonAsync(new { message = "hello world" });
 });
 
-app.Run($"http://localhost:{port}");
+app.MapPost("/", async context =>
+{
+  context.Response.StatusCode = 200;
+  await context.Response.CompleteAsync();
+});
+
+app.Run($"http://0.0.0.0:{port}");

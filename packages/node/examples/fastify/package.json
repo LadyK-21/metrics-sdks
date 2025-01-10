@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "name": "readme-metrics-fastify-demo",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start:metrics": "npx node-dev index.js"
+  },
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "fastify": "^4.13.0",
+    "readmeio": "file:../.."
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "rootDir": ".",
+
+    // Allows us to not have to typeguard in catches.
+    // https://bobbyhadz.com/blog/typescript-object-is-of-type-unknown
+    "useUnknownInCatchVariables": false
+  },
+  "exclude": ["dist"],
+  "include": ["src"]
+}

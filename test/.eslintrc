@@ -1,0 +1,8 @@
+{
+  "extends": "@readme/eslint-config/testing/vitest",
+  "rules": {
+    "import/extensions": ["error", "ignorePackages"],
+    "no-underscore-dangle": "off",
+    "unicorn/no-unsafe-regex": "off"
+  }
+}

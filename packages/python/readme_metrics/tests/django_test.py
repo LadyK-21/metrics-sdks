@@ -1,9 +1,6 @@
 from datetime import datetime, timedelta
-import os
 import time
-from unittest.mock import Mock, MagicMock, patch
-
-import pytest
+from unittest.mock import Mock, AsyncMock
 
 from readme_metrics import MetricsApiConfig
 from readme_metrics.django import MetricsMiddleware
@@ -18,24 +15,31 @@ mock_config = MetricsApiConfig(
 
 
 class TestDjangoMiddleware:
-    def test(self):
-        response = Mock()
+    def setup_middleware(self, is_async=False):
+        response = AsyncMock() if is_async else Mock()
         response.headers = {"X-Header": "X Value!"}
-        get_response = Mock(return_value=response)
+        get_response = (
+            AsyncMock(return_value=response)
+            if is_async
+            else Mock(return_value=response)
+        )
 
         middleware = MetricsMiddleware(get_response, config=mock_config)
-        assert middleware.get_response == get_response
         middleware.metrics_core = Mock()
+        return middleware
 
-        # the middleware should call get_response(request)
-        request = Mock()
-        middleware(request)
-        get_response.assert_called_once_with(request)
+    def validate_metrics(self, middleware, request, is_async=False):
+        if is_async:
+            # the middleware should await get_response(request)
+            middleware.get_response.assert_awaited_once_with(request)
+        else:
+            # the middleware should call get_response(request)
+            middleware.get_response.assert_called_once_with(request)
 
         # the middleware should set request.rm_start_dt to roughly the current
         # datetime
         assert hasattr(request, "rm_start_dt")
-        req_start_dt = datetime.strptime(request.rm_start_dt, "%Y-%m-%d %H:%M:%S.%f")
+        req_start_dt = datetime.strptime(request.rm_start_dt, "%Y-%m-%dT%H:%M:%SZ")
         current_dt = datetime.utcnow()
         assert abs(current_dt - req_start_dt) < timedelta(seconds=1)
 
@@ -55,3 +59,39 @@ class TestDjangoMiddleware:
         assert call_args[0][0] == request
         assert isinstance(call_args[0][1], ResponseInfoWrapper)
         assert call_args[0][1].headers.get("X-Header") == "X Value!"
+        assert (
+            getattr(request, "rm_content_length") == request.headers["Content-Length"]
+        )
+
+    def test_sync(self):
+        middleware = self.setup_middleware()
+
+        request = Mock()
+        request.headers = {"Content-Length": "123"}
+        middleware(request)
+
+        self.validate_metrics(middleware, request)
+
+    async def test_async(self):
+        middleware = self.setup_middleware(is_async=True)
+
+        request = AsyncMock()
+        request.headers = {"Content-Length": "123"}
+        await middleware(request)
+
+        self.validate_metrics(middleware, request, is_async=True)
+
+    def test_missing_content_length(self):
+        middleware = MetricsMiddleware(Mock(), config=mock_config)
+        request = Mock()
+        request.headers = {}
+        middleware(request)
+        assert getattr(request, "rm_content_length") == "0"
+
+    def test_options_request(self):
+        middleware = MetricsMiddleware(Mock(), config=mock_config)
+        middleware.metrics_core = Mock()
+        request = Mock()
+        request.method = "OPTIONS"
+        middleware(request)
+        assert not middleware.metrics_core.process.called

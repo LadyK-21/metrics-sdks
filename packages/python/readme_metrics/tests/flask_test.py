@@ -1,10 +1,8 @@
 from datetime import datetime, timedelta
 import time
-from unittest.mock import Mock, MagicMock
-from werkzeug.datastructures import EnvironHeaders
+from unittest.mock import Mock
 
 from flask import Flask, request
-import pytest
 from readme_metrics import MetricsApiConfig
 from readme_metrics.flask_readme import ReadMeMetrics
 from readme_metrics.ResponseInfoWrapper import ResponseInfoWrapper
@@ -21,7 +19,7 @@ class TestFlaskExtension:
     def setUp(self):
         pass
 
-    def testInit(self):
+    def test_init(self):
         # the extension should register itself with the Flask application
         # provided to the constructor
         app = Mock()
@@ -29,7 +27,7 @@ class TestFlaskExtension:
         app.before_request.assert_called_with(extension.before_request)
         app.after_request.assert_called_with(extension.after_request)
 
-    def testBeforeRequest(self):
+    def test_before_request(self):
         app = Flask(__name__)
         extension = ReadMeMetrics(config=mock_config, app=app)
         with app.test_request_context("/"):
@@ -38,9 +36,7 @@ class TestFlaskExtension:
             # ensure that before_request has set request.rm_start_dt to
             # roughly the current datetime
             assert hasattr(request, "rm_start_dt")
-            req_start_dt = datetime.strptime(
-                request.rm_start_dt, "%Y-%m-%d %H:%M:%S.%f"
-            )
+            req_start_dt = datetime.strptime(request.rm_start_dt, "%Y-%m-%dT%H:%M:%SZ")
             current_dt = datetime.utcnow()
             assert abs(current_dt - req_start_dt) < timedelta(seconds=1)
 
@@ -51,7 +47,7 @@ class TestFlaskExtension:
             current_millis = time.time() * 1000.0
             assert abs(current_millis - req_start_millis) < 1000.00
 
-    def testAfterRequest(self):
+    def test_after_request(self):
         app = Flask(__name__)
         print("hello")
         extension = ReadMeMetrics(config=mock_config, app=app)
@@ -73,3 +69,15 @@ class TestFlaskExtension:
         assert call_args[0][0] == request
         assert isinstance(call_args[0][1], ResponseInfoWrapper)
         assert call_args[0][1].headers.get("X-Header") == "X Value!"
+
+    def test_before_request_options(self):
+        app = Flask(__name__)
+        extension = ReadMeMetrics(config=mock_config, app=app)
+
+        with app.test_request_context("/", method="OPTIONS"):
+            extension.before_request()
+
+            assert not hasattr(request, "rm_start_dt")
+            assert not hasattr(request, "rm_start_ts")
+            assert not hasattr(request, "rm_content_length")
+            assert not hasattr(request, "rm_body")

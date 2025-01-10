@@ -1,15 +1,22 @@
-from collections.abc import Mapping
+import importlib
 import json
 from json import JSONDecodeError
 from logging import Logger
-import sys
+import platform
 import time
-import importlib
+
 from typing import List, Optional
 from urllib import parse
+from .ResponseInfoWrapper import ResponseInfoWrapper
+from .util import mask
 
-import requests
-from readme_metrics import ResponseInfoWrapper
+
+class QueryNotFound(Exception):
+    pass
+
+
+class BaseURLError(Exception):
+    pass
 
 
 class PayloadBuilder:
@@ -42,15 +49,17 @@ class PayloadBuilder:
             development_mode (bool): Development mode flag passed to ReadMe
             grouping_function ([type]): Grouping function to generate an identity
                 payload
-            logger (Logger): Loggiing
+            logger (Logger): Logging
         """
         self.denylist = denylist
         self.allowlist = allowlist
-        self.development_mode = "true" if development_mode else "false"
+        self.development_mode = development_mode
         self.grouping_function = grouping_function
         self.logger = logger
 
-    def __call__(self, request, response: ResponseInfoWrapper) -> dict:
+    def __call__(
+        self, request, response: ResponseInfoWrapper, logId: str
+    ) -> Optional[dict]:
         """Builds a HAR payload encompassing the request & response data
 
         Args:
@@ -66,16 +75,24 @@ class PayloadBuilder:
         if group is None:
             return None
 
+        if hasattr(request, "environ"):
+            client_ip_address = request.environ.get("REMOTE_ADDR")
+        else:
+            client_ip_address = (
+                request.scope["client"][0] if hasattr(request, "scope") else None
+            )
+
         payload = {
+            "_id": logId,
             "group": group,
-            "clientIPAddress": request.environ.get("REMOTE_ADDR"),
+            "clientIPAddress": client_ip_address,
             "development": self.development_mode,
             "request": {
                 "log": {
                     "creator": {
-                        "name": __name__,
+                        "name": "readme-metrics (python)",
                         "version": importlib.import_module(__package__).__version__,
-                        "comment": sys.version,
+                        "comment": self._get_har_creator_comment(),
                     },
                     "entries": [
                         {
@@ -91,6 +108,17 @@ class PayloadBuilder:
         }
 
         return payload
+
+    def _get_har_creator_comment(self):
+        # arm64-darwin21.3.0/3.8.9
+        return (
+            platform.machine()
+            + "-"
+            + platform.system().lower()
+            + platform.uname().release
+            + "/"
+            + platform.python_version()
+        )
 
     def _validate_group(self, group: Optional[dict]):
         if group is None:
@@ -114,6 +142,9 @@ class PayloadBuilder:
             )
             return None
 
+        # Mask the id / api_key
+        group["id"] = mask(group["id"])
+
         for field in ["email", "label"]:
             if field not in group:
                 self.logger.warning(
@@ -122,6 +153,7 @@ class PayloadBuilder:
                 )
         extra_fields = set(group.keys()).difference(["id", "email", "label"])
         if extra_fields:
+            # pylint: disable=C0301
             self.logger.warning(
                 "Grouping function included unexpected field(s) in response: %s; discarding those fields and logging request anyway",
                 extra_fields,
@@ -131,32 +163,90 @@ class PayloadBuilder:
 
         return group
 
+    def _get_content_type(self, headers):
+        return headers.get("content-type", "text/plain")
+
     def _build_request_payload(self, request) -> dict:
         """Wraps the request portion of the payload
 
         Args:
             request (Request): Request object containing the request information, either
-                a `werkzeug.Request` or a `django.core.handlers.wsgi.WSGIRequest`.
+                a `werkzeug.Request`, `django.core.handlers.wsgi.WSGIRequest`, or
+                a `django.core.handlers.asgi.ASGIRequest`.
 
         Returns:
             dict: Wrapped request payload
         """
-        headers = self._redact_dict(request.headers)
-        params = parse.parse_qsl(self._get_query_string(request))
+        headers = self.redact_dict(request.headers)
 
-        if getattr(request, "content_length", None):
-            post_data = self._process_body(request.rm_body)
+        queryString = parse.parse_qsl(self._get_query_string(request))
+
+        content_type = self._get_content_type(headers)
+        post_data = False
+        if getattr(request, "content_length", None) or getattr(
+            request, "rm_content_length", None
+        ):
+            if content_type == "application/x-www-form-urlencoded":
+                # Flask creates `request.form` but Django puts that data in `request.body`, and
+                # then our `request.rm_body` store, instead.
+                if hasattr(request, "form"):
+                    params = [
+                        # Reason this is not mixed in with the `rm_body` parsing if we don't have
+                        # `request.form` is that if we attempt to do `str(var, 'utf-8)` on data
+                        # coming out of `request.form.items()` an "decoding str is not supported"
+                        # exception will be raised as they're already strings.
+                        {"name": k, "value": v}
+                        for (k, v) in request.form.items()
+                    ]
+                else:
+                    params = [
+                        # `request.form.items` will give us already decoded UTF-8 data but
+                        # `parse_qsl` gives us bytes. If we don't do this we'll be creating an
+                        # invalid JSON payload.
+                        {
+                            "name": str(k, "utf-8"),
+                            "value": str(v, "utf-8"),
+                        }
+                        for (k, v) in parse.parse_qsl(request.rm_body)
+                    ]
+
+                post_data = {
+                    "mimeType": content_type,
+                    "params": params,
+                }
+            else:
+                post_data = self._process_body(content_type, request.rm_body)
+
+        headers = dict(headers)
+
+        if "Authorization" in headers:
+            headers["Authorization"] = mask(headers["Authorization"])
+
+        if hasattr(request, "environ"):
+            http_version = request.environ["SERVER_PROTOCOL"]
+        elif hasattr(request, "scope"):
+            http_version = f'HTTP/{request.scope["http_version"]}'
         else:
-            post_data = {}
+            http_version = ""
+            self.logger.warning(
+                "Unable to detect the HTTP version. Setting default to 'HTTP/1.1'."
+            )
 
-        return {
+        payload = {
             "method": request.method,
             "url": self._build_base_url(request),
-            "httpVersion": request.environ["SERVER_PROTOCOL"],
+            "httpVersion": http_version,
             "headers": [{"name": k, "value": v} for (k, v) in headers.items()],
-            "queryString": [{"name": k, "value": v} for (k, v) in params],
-            **post_data,
+            "headersSize": -1,
+            "queryString": [{"name": k, "value": v} for (k, v) in queryString],
+            "cookies": [],
+            "bodySize": -1,
         }
+
+        if not post_data is False:
+            payload["postData"] = post_data
+
+        return payload
 
     def _build_response_payload(self, response: ResponseInfoWrapper) -> dict:
         """Wraps the response portion of the payload
@@ -167,8 +257,9 @@ class PayloadBuilder:
         Returns:
             dict: Wrapped response payload
         """
-        headers = self._redact_dict(response.headers)
-        body = self._process_body(response.body).get("text")
+        headers = self.redact_dict(response.headers)
+        content_type = self._get_content_type(response.headers)
+        body = self._process_body(content_type, response.body).get("text")
 
         headers = [{"name": k, "value": v} for (k, v) in headers.items()]
 
@@ -179,10 +270,12 @@ class PayloadBuilder:
         return {
             "status": status_code,
             "statusText": status_text or "",
-            "headers": headers,  # headers.items(),
+            "headers": headers,
+            "headersSize": -1,
+            "bodySize": int(response.content_length),
             "content": {
                 "text": body,
-                "size": response.content_length,
+                "size": int(response.content_length),
                 "mimeType": response.content_type,
             },
         }
@@ -201,11 +294,13 @@ class PayloadBuilder:
         if hasattr(request, "query_string"):
             # works for Werkzeug request objects only
             result = request.query_string
-        elif "QUERY_STRING" in request.environ:
+        elif hasattr(request, "environ") and "QUERY_STRING" in request.environ:
             # works for Django, and possibly other request objects too
             result = request.environ["QUERY_STRING"]
+        elif hasattr(request, "scope"):
+            result = request.scope["query_string"]
         else:
-            raise Exception(
+            raise QueryNotFound(
                 "Don't know how to retrieve query string from this type of request"
             )
 
@@ -226,31 +321,44 @@ class PayloadBuilder:
         Returns:
             str: Query string, for example "https://api.example.local:8080/v1/userinfo"
         """
+        query_string = self._get_query_string(request)
         if hasattr(request, "base_url"):
             # Werkzeug request objects already have exactly what we need
-            return request.base_url
+            base_url = request.base_url
+            if len(query_string) > 0:
+                base_url += f"?{query_string}"
+            return base_url
 
         scheme, host, path = None, None, None
 
-        if "wsgi.url_scheme" in request.environ:
+        if hasattr(request, "environ") and "wsgi.url_scheme" in request.environ:
             scheme = request.environ["wsgi.url_scheme"]
+        elif hasattr(request, "scheme"):
+            scheme = request.scheme
 
+        # pylint: disable=protected-access
         if hasattr(request, "_get_raw_host"):
             # Django request objects already have a properly formatted host field
             host = request._get_raw_host()
-        elif "HTTP_HOST" in request.environ:
+        elif hasattr(request, "environ") and "HTTP_HOST" in request.environ:
             host = request.environ["HTTP_HOST"]
+        elif hasattr(request, "scope"):
+            host = request.headers.get("host")
 
-        if "PATH_INFO" in request.environ:
+        if hasattr(request, "environ") and "PATH_INFO" in request.environ:
             path = request.environ["PATH_INFO"]
+        elif hasattr(request, "scope"):
+            path = request.scope["path"]
 
         if scheme and path and host:
+            if len(query_string) > 0:
+                return f"{scheme}://{host}{path}?{query_string}"
             return f"{scheme}://{host}{path}"
-        else:
-            raise Exception("Don't know how to build URL from this type of request")
+
+        raise BaseURLError("Don't know how to build URL from this type of request")
 
     # always returns a dict with some of these fields: text, mimeType, params
-    def _process_body(self, body):
+    def _process_body(self, content_type, body):
         if isinstance(body, bytes):
             # Non-unicode bytes cannot be directly serialized as a JSON
             # payload to send to the ReadMe API, so we need to convert this to a
@@ -262,53 +370,42 @@ class PayloadBuilder:
             try:
                 body = body.decode("utf-8")
             except UnicodeDecodeError:
-                return {"text": "[NOT VALID UTF-8]"}
+                return {"mimeType": content_type, "text": "[NOT VALID UTF-8]"}
 
         if not isinstance(body, str):
             # We don't know how to process this body. If it's safe to encode as
             # JSON, return it unchanged; otherwise return an error.
             try:
                 json.dumps(body)
-                return {"text": body}
+                return {"mimeType": content_type, "text": body}
             except TypeError:
-                return {"text": "[ERROR: NOT SERIALIZABLE]"}
+                return {"mimeType": content_type, "text": "[ERROR: NOT SERIALIZABLE]"}
 
         try:
             body_data = json.loads(body)
         except JSONDecodeError:
-            params = parse.parse_qsl(body)
-            if params:
-                return {
-                    "text": body,
-                    "mimeType": "multipart/form-data",
-                    "params": [{"name": k, "value": v} for (k, v) in params],
-                }
-            else:
-                return {"text": body}
+            return {"mimeType": content_type, "text": body}
 
         if (self.denylist or self.allowlist) and isinstance(body_data, dict):
-            redacted_data = self._redact_dict(body_data)
+            redacted_data = self.redact_dict(body_data)
             body = json.dumps(redacted_data)
 
-        return {"text": body, "mimeType": "application/json"}
+        return {"mimeType": content_type, "text": body}
 
-    def _redact_dict(self, mapping: Mapping):
-        def _redact_value(v):
-            if isinstance(v, str):
-                return f"[REDACTED {len(v)}]"
-            else:
-                return "[REDACTED]"
+    def redact_dict(self, mapping: dict) -> dict:
+        def _redact_value(val):
+            return f"[REDACTED {len(val)}]" if isinstance(val, str) else "[REDACTED]"
 
-        # Short-circuit this function if there's no allowlist or denylist
-        if not (self.allowlist or self.denylist):
+        if not self.allowlist and not self.denylist:
             return mapping
 
-        result = dict()
-        for (key, value) in mapping.items():
+        result = {}
+        for key, value in mapping.items():
             if self.denylist and key in self.denylist:
                 result[key] = _redact_value(value)
             elif self.allowlist and key not in self.allowlist:
                 result[key] = _redact_value(value)
             else:
                 result[key] = value
+
         return result

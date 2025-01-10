@@ -1,75 +1,136 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
-    directory: "/"
+    directory: '/'
     schedule:
       interval: monthly
+    allow:
+      - dependency-type: production
     labels:
       - dependencies
+    groups:
+      minor-production-deps:
+        dependency-type: 'production'
+        update-types:
+          - minor
+          - patch
+      minor-development-deps:
+        dependency-type: 'development'
+        update-types:
+          - minor
+          - patch
     commit-message:
       prefix: chore(deps)
       prefix-development: chore(deps-dev)
 
   - package-ecosystem: npm
-    directory: "/"
+    directory: '/'
     schedule:
       interval: monthly
+    allow:
+      - dependency-type: production
     open-pull-requests-limit: 10
     labels:
       - dependencies
-    commit-message:
-      prefix: chore(deps)
-      prefix-development: chore(deps-dev)
-
-  - package-ecosystem: npm
-    directory: "/packages/node"
-    schedule:
-      interval: monthly
-    open-pull-requests-limit: 10
-    labels:
-      - dependencies
-      - area:node
+    groups:
+      minor-production-deps:
+        dependency-type: 'production'
+        update-types:
+          - minor
+          - patch
+      minor-development-deps:
+        dependency-type: 'development'
+        update-types:
+          - minor
+          - patch
     commit-message:
       prefix: chore(deps)
       prefix-development: chore(deps-dev)
     ignore:
-      # node-fetch is now an ESM package and can't be used here without a rewrite.
-      - dependency-name: node-fetch
+      # These packages are now ESM-only and can't be used without a rewrite.
+      - dependency-name: find-cache-dir
         versions:
-          - ">= 3"
+          - '>= 4'
 
-#   - package-ecosystem: bundler
-#     directory: "/packages/ruby"
-#     schedule:
-#       interval: monthly
-#     open-pull-requests-limit: 10
-#     labels:
-#       - dependencies
-#       - area:ruby
-#     commit-message:
-#       prefix: chore(deps)
-#       prefix-development: chore(deps-dev)
-
-  - package-ecosystem: composer
-    directory: "/packages/php"
+  - package-ecosystem: npm
+    directory: '/packages/node'
     schedule:
       interval: monthly
+    allow:
+      - dependency-type: production
     open-pull-requests-limit: 10
     labels:
       - dependencies
-      - area:php
+      - node
+    groups:
+      minor-production-deps:
+        dependency-type: 'production'
+        update-types:
+          - minor
+          - patch
+      minor-development-deps:
+        dependency-type: 'development'
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore(deps)
+      prefix-development: chore(deps-dev)
+    ignore:
+      # These packages are now ESM-only and can't be used without a rewrite.
+      - dependency-name: find-cache-dir
+        versions:
+          - '>= 4'
+
+  - package-ecosystem: bundler
+    directory: '/packages/ruby'
+    schedule:
+      interval: monthly
+    allow:
+      - dependency-type: production
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - ruby
     commit-message:
       prefix: chore(deps)
       prefix-development: chore(deps-dev)
 
-#   - package-ecosystem: pip
-#     directory: "/packages/python"
-#     schedule:
-#       interval: monthly
-#     open-pull-requests-limit: 10
-#     labels:
-#       - dependencies
-#       - area:python
-#     commit-message:
-#       prefix: chore(deps)
-#       prefix-development: chore(deps-dev)
+  - package-ecosystem: composer
+    directory: '/packages/php'
+    schedule:
+      interval: monthly
+    allow:
+      - dependency-type: production
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - php
+    groups:
+      minor-production-deps:
+        dependency-type: 'production'
+        update-types:
+          - minor
+          - patch
+      minor-development-deps:
+        dependency-type: 'development'
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore(deps)
+      prefix-development: chore(deps-dev)
+
+  - package-ecosystem: pip
+    directory: "/packages/python"
+    schedule:
+      interval: monthly
+    allow:
+      - dependency-type: production
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: chore(deps)
+      prefix-development: chore(deps-dev)

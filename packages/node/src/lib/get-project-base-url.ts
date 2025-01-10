@@ -1,12 +1,18 @@
-import flatCache from 'flat-cache';
-import findCacheDir from 'find-cache-dir';
 import crypto from 'crypto';
-import pkg from '../../package.json';
+
+import findCacheDir from 'find-cache-dir';
+import { FlatCache } from 'flat-cache';
 import timeoutSignal from 'timeout-signal';
-import fetch from 'node-fetch';
+
+import pkg from '../../package.json';
 import config from '../config';
 
-export async function getProjectBaseUrl(encodedApiKey, requestTimeout) {
+import { logger } from './logger';
+
+export const cache = new FlatCache();
+
+export function getCache(readmeApiKey: string) {
+  const encodedApiKey = Buffer.from(`${readmeApiKey}:`).toString('base64');
   const cacheDir = findCacheDir({ name: pkg.name, create: true });
   const fsSafeApikey = crypto.createHash('md5').update(encodedApiKey).digest('hex');
 
@@ -14,11 +20,16 @@ export async function getProjectBaseUrl(encodedApiKey, requestTimeout) {
   // automatically get refreshed when the package is updated/installed.
   const cacheKey = `${pkg.name}-${pkg.version}-${fsSafeApikey}`;
 
-  const cache = flatCache.load(cacheKey, cacheDir);
+  return cache.load(cacheKey, cacheDir);
+}
 
+export async function getProjectBaseUrl(readmeApiKey: string, requestTimeout = config.timeout): Promise<string> {
+  const encodedApiKey = Buffer.from(`${readmeApiKey}:`).toString('base64');
+
+  getCache(readmeApiKey);
   // Does the cache exist? If it doesn't, let's fill it. If it does, let's see if it's stale. Caches should have a TTL
   // of 1 day.
-  const lastUpdated = cache.getKey('lastUpdated');
+  const lastUpdated = cache.getKey<number>('lastUpdated');
 
   if (
     lastUpdated === undefined ||
@@ -26,21 +37,26 @@ export async function getProjectBaseUrl(encodedApiKey, requestTimeout) {
   ) {
     const signal = timeoutSignal(requestTimeout);
 
-    let baseUrl;
+    let baseUrl = '';
     await fetch(`${config.readmeApiUrl}/v1/`, {
       method: 'get',
       headers: {
         Authorization: `Basic ${encodedApiKey}`,
         'User-Agent': `${pkg.name}/${pkg.version}`,
       },
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      // @ts-ignore
       signal,
     })
       .then(res => {
         if (res.status >= 400 && res.status <= 599) {
           throw res;
         }
-
-        return res.json();
+        const logLevel = res.ok ? 'info' : 'error';
+        logger[logLevel]({
+          message: `Fetch Base URL: Service responded with status ${res.status}: ${res.statusText}.`,
+        });
+        return res.json() as Promise<{ baseUrl: string }>;
       })
       .then(project => {
         baseUrl = project.baseUrl;
@@ -62,6 +78,7 @@ export async function getProjectBaseUrl(encodedApiKey, requestTimeout) {
 
     return baseUrl;
   }
-
-  return cache.getKey('baseUrl');
+  const cachedBaseUrl = cache.getKey<string>('baseUrl');
+  logger.verbose({ message: 'Retrieved baseUrl from cache.', args: { baseUrl: cachedBaseUrl } });
+  return cachedBaseUrl;
 }

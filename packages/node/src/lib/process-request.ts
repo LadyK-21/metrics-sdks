@@ -1,16 +1,19 @@
 import type { LogOptions } from './construct-payload';
-import type { Entry } from 'har-format';
-import type { IncomingMessage } from 'http';
-import url, { URL } from 'url';
-import get from 'lodash/get';
-import set from 'lodash/set';
-import pick from 'lodash/pick';
-import merge from 'lodash/merge';
-import * as contentType from 'content-type';
-import * as qs from 'querystring';
+import type { ExtendedIncomingMessage } from './log';
+import type { Cookie, Param, PostData, Request } from 'har-format';
 
+import * as qs from 'querystring';
+import url, { URL } from 'url';
+
+import * as contentType from 'content-type';
+import get from 'lodash/get';
+import merge from 'lodash/merge';
+import pick from 'lodash/pick';
+import set from 'lodash/set';
+
+import { getProto, mask } from './construct-payload';
+import { logger } from './logger';
 import { objectToArray, searchToArray } from './object-to-array';
-import { getProto } from './construct-payload';
 
 /**
  * Ensure we have a string or undefined response for any header.
@@ -18,7 +21,7 @@ import { getProto } from './construct-payload';
  * @param header
  * @returns
  */
-export function fixHeader(header: string | number | string[]): string | undefined {
+export function fixHeader(header: string[] | number | string): string | undefined {
   if (header === undefined) {
     return undefined;
   }
@@ -36,7 +39,7 @@ export function fixHeader(header: string | number | string[]): string | undefine
  * @param value the value to be redacted
  * @returns A redacted string potentially containing the length of the original value, if it was a string
  */
-function redactValue(value: string) {
+function redactValue(value: unknown) {
   const redactedVal = typeof value === 'string' ? ` ${value.length}` : '';
   return `[REDACTED${redactedVal}]`;
 }
@@ -48,7 +51,7 @@ function redactValue(value: string) {
  * @param redactedPaths a list of paths that point values which should be redacted
  * @returns An object with the redacted values
  */
-function redactProperties<T extends Record<string, unknown>>(obj: T, redactedPaths = []): T {
+function redactProperties<T extends Record<string, unknown>>(obj: T, redactedPaths: string[] = []): T {
   const nextObj = { ...obj };
   return redactedPaths.reduce((acc, path) => {
     const value = get(acc, path);
@@ -62,11 +65,14 @@ function redactProperties<T extends Record<string, unknown>>(obj: T, redactedPat
  * @param cb A callback that is invoked for each value found, the return value being the next value that is set in the returned object
  * @returns An object with the replaced values
  */
-function replaceEach(obj, cb): Record<string, unknown> {
-  return Object.keys(obj).reduce((acc, key) => {
+function replaceEach<T extends Record<string, unknown>>(
+  obj: T,
+  cb: (input: unknown) => string,
+): Record<string, unknown> {
+  return Object.keys(obj).reduce<Record<string, unknown>>((acc, key) => {
     const value = obj[key];
     if (typeof value === 'object' && value !== null) {
-      acc[key] = replaceEach(value, cb);
+      acc[key] = replaceEach(value as Record<string, unknown>, cb);
     } else if (value !== undefined) {
       acc[key] = cb(value);
     }
@@ -81,13 +87,13 @@ function replaceEach(obj, cb): Record<string, unknown> {
  * @param nonRedactedPaths A list of all object paths that shouldn't be redacted
  * @returns A merged objects that is entirely redacted except for the values of the nonRedactedPaths
  */
-function redactOtherProperties<T extends Record<string, unknown>>(obj: T, nonRedactedPaths): T {
+function redactOtherProperties<T extends Record<string, unknown>>(obj: T, nonRedactedPaths: string[]): T {
   const allowedFields = pick(obj, nonRedactedPaths);
   const redactedFields = obj ? replaceEach(obj, redactValue) : obj;
-  return merge(redactedFields, allowedFields);
+  return merge(redactedFields, allowedFields) as T;
 }
 
-function isApplicationJson(mimeType) {
+function isApplicationJson(mimeType: string) {
   if (!mimeType) {
     return false;
   }
@@ -104,7 +110,11 @@ function parseRequestBody(body: string, mimeType: string): Record<string, unknow
   }
 
   if (isApplicationJson(mimeType)) {
-    return JSON.parse(body);
+    try {
+      return JSON.parse(body);
+    } catch (err) {
+      logger.error({ message: 'Error parsing request body JSON.', err });
+    }
   }
 
   return body;
@@ -120,20 +130,23 @@ function parseRequestBody(body: string, mimeType: string): Record<string, unknow
  * @returns The proper request structure following the HAR format
  */
 export default function processRequest(
-  req: IncomingMessage,
+  req: ExtendedIncomingMessage,
   requestBody?: Record<string, unknown> | string,
-  options?: LogOptions
-): Entry['request'] {
+  options?: LogOptions,
+): Request {
+  const protocol = fixHeader(req.headers['x-forwarded-proto'] || '')?.toLowerCase() || getProto(req);
+  const host = fixHeader(req.headers['x-forwarded-host'] || '') || req.headers.host;
+
   const denylist = options?.denylist || options?.blacklist;
   const allowlist = options?.allowlist || options?.whitelist;
 
-  let mimeType: string = null;
+  let mimeType = '';
   try {
-    mimeType = contentType.parse(req.headers['content-type']).type;
+    mimeType = contentType.parse(req.headers['content-type'] || '').type;
   } catch (e) {} // eslint-disable-line no-empty
 
   let reqBody = typeof requestBody === 'string' ? parseRequestBody(requestBody, mimeType) : requestBody;
-  let postData: Entry['request']['postData'] = null;
+  let postData: PostData | undefined;
 
   if (denylist) {
     reqBody = typeof reqBody === 'object' ? redactProperties(reqBody, denylist) : reqBody;
@@ -148,15 +161,13 @@ export default function processRequest(
   if (mimeType === 'application/x-www-form-urlencoded') {
     postData = {
       mimeType,
-      // There might be a better way to type this, but this works for now.
-      // If the mimeType is application/x-www-form-urlencoded, then the body is always going to be an object here.
-      params: objectToArray(reqBody as Record<string, unknown>),
-      text: null,
+      // `reqBody` is likely to be an object, but can be empty if no HTTP body sent
+      params: objectToArray((reqBody || {}) as Record<string, unknown>) as Param[],
     };
   } else if (isApplicationJson(mimeType)) {
     postData = {
       mimeType,
-      text: JSON.stringify(reqBody),
+      text: typeof reqBody === 'object' || Array.isArray(reqBody) ? JSON.stringify(reqBody) : reqBody || '',
     };
   } else if (mimeType) {
     let stringBody = '';
@@ -174,14 +185,17 @@ export default function processRequest(
     };
   }
 
-  const protocol = fixHeader(req.headers['x-forwarded-proto'])?.toLowerCase() || getProto(req);
-  const host = fixHeader(req.headers['x-forwarded-host']) || req.headers.host;
   // We use a fake host here because we rely on the host header which could be redacted.
   // We only ever use this reqUrl with the fake hostname for the pathname and querystring.
-  const reqUrl = new URL(req.url, `https://readme.io`);
+  // req.originalUrl is express specific, req.url is node.js
+  const reqUrl = new URL(req.originalUrl || req.url || '', 'https://readme.io');
 
-  const requestData = {
-    method: req.method,
+  if (req.headers.authorization) {
+    req.headers.authorization = mask(req.headers.authorization);
+  }
+
+  const requestData: Request = {
+    method: req.method || '',
     url: url.format({
       // Handle cases where some reverse proxies put two protocols into x-forwarded-proto
       // This line does the following: "https,http" -> "https"
@@ -193,18 +207,19 @@ export default function processRequest(
       query: qs.parse(reqUrl.search.substring(1)),
     }),
     httpVersion: `${getProto(req).toUpperCase()}/${req.httpVersion}`,
-    headers: objectToArray(req.headers),
+    headers: objectToArray(req.headers, { castToString: true }),
     queryString: searchToArray(reqUrl.searchParams),
     postData,
     // TODO: When readme starts accepting these, send the correct values
-    cookies: [],
-    headersSize: 0,
-    bodySize: 0,
-  };
+    cookies: [] satisfies Cookie[],
+    headersSize: -1,
+    bodySize: -1,
+  } as const;
 
-  // At the moment the server doesn't accept null for request bodies. We're opening up support soon, but getting this fix out will be faster.
-  if (requestData.postData === null) {
-    delete requestData.postData;
+  if (typeof requestData.postData === 'undefined') {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { postData: postDataToBeOmitted, ...remainingRequestData } = requestData;
+    return remainingRequestData;
   }
 
   return requestData;

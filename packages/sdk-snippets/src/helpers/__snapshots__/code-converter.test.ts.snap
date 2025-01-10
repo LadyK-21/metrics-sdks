@@ -1,0 +1,25 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`code-converter > should convert code to a CodeBuilder instance 1`] = `
+"
+blank()
+
+push(\\"import express from 'express';\\");
+
+blank()
+
+push('const app = express();');
+
+blank()
+
+push(\\"app.get('/', (req, res) => {\\");
+push('res.sendStatus(200);', 1);
+push('});');
+
+blank()
+
+push('app.listen(8000);');
+
+blank()
+"
+`;

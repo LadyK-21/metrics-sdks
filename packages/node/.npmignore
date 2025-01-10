@@ -1,7 +1,6 @@
-.github/
+.nyc_output/
 coverage/
-__tests__/
-.eslint*
-.jsinspectrc
-.prettier*
 examples/
+test/
+.eslint*
+.prettier*

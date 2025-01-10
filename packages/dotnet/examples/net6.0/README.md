@@ -1,17 +1,17 @@
 # ReadMe Metrics .NET 6.0 Demo
 
-## Install
-
 ```sh
-brew install dotnet
+make install
 ```
 
-## Run
+## 📊 Metrics
+
 ```sh
-README_API_KEY=<Your ReadMe API Key here> dotnet run
+make serve-metrics-dotnet
 ```
 
-## Test
+Access your test server to demo Metrics by making a cURL request:
+
 ```sh
-curl http://localhost:4000
+curl http://localhost:8000
 ```

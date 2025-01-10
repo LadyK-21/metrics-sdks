@@ -1,0 +1,22 @@
+{
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.codeActionsOnSave": {
+    "source.fixAll": "explicit"
+  },
+  "editor.formatOnSave": true,
+  "search.exclude": {
+    // Hide generated output
+    "**/package-lock.json": true,
+    "**/composer.lock": true,
+    "packages/php/examples/laravel/bootstrap/cache/*.php": true,
+    "packages/php/examples/laravel/storage/**": true,
+    "packages/python/build/**": true,
+    "packages/python/readme_metrics.egg*": true,
+
+    // Hide test coverage directories
+    "**/coverage": true,
+
+    // Hide vendor directories
+    "**/{node_modules,vendor}": true,
+  }
+}

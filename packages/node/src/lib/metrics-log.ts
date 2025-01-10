@@ -1,34 +1,41 @@
-import type { Response } from 'node-fetch';
-import type { PayloadData, LogOptions } from './construct-payload';
-import type { ServerResponse, IncomingMessage } from 'http';
+import type { Options } from './log';
 import type { Har } from 'har-format';
-import fetch from 'node-fetch';
+import type { UUID } from 'node:crypto';
+
 import timeoutSignal from 'timeout-signal';
+
 import pkg from '../../package.json';
 import config from '../config';
-import { constructPayload } from './construct-payload';
+
+import { logger } from './logger';
 
 export interface GroupingObject {
   /**
-   * API Key used to make the request. Note that this is different from the `readmeAPIKey` described above and should be a value from your API that is unique to each of your users.
+   * API Key used to make the request. Note that this is different from the `readmeAPIKey`
+   * described above and should be a value from your API that is unique to each of your users.
    */
   apiKey: string;
+
   /**
-   * @deprecated use apiKey instead
+   * Email of the user that is making the call.
+   */
+  email?: string;
+
+  /**
+   * @deprecated use `apiKey` instead
    */
   id?: string;
+
   /**
-   * This will be the user's display name in the API Metrics Dashboard, since it's much easier to remember a name than an API key.
+   * This will be the user's display name in the API Metrics Dashboard, since it's much easier to
+   * remember a name than an API key.
    */
-  label: string;
-  /**
-   * Email of the user that is making the call
-   */
-  email: string;
+  label?: string;
 }
 
 export interface OutgoingLogBody {
-  _id?: string;
+  _id?: UUID;
+  _version: number;
   clientIPAddress: string;
   development: boolean;
   // API Key is currently a mapping to ID. Eventually we will support this server side. The omit and readdition of ID is to remove the deprecated warning in the meanwhile
@@ -36,28 +43,65 @@ export interface OutgoingLogBody {
   request: Har;
 }
 
+type LogId = UUID | UUID[] | undefined;
+
 export interface LogResponse {
+  ids: LogId;
   response?: Response;
-  ids: string | string[];
 }
 
-function getLogIds(body: OutgoingLogBody | OutgoingLogBody[]): string | string[] {
+const BACKOFF_SECONDS = 15; // when we need to backoff HTTP requests, pause for seconds
+
+let backoffExpiresAt: Date | undefined;
+
+// Exported for use in unit tests
+export function setBackoff(expiresAt: Date | undefined) {
+  backoffExpiresAt = expiresAt;
+}
+
+function shouldBackoff(response: Response) {
+  // Some HTTP error codes indicate a problem with the API key, like the key is
+  // invalid or it's being rate limited. To avoid pointless requests to the
+  // ReadMe server, pause outgoing requests for a few seconds before trying
+  // again. Logs will be silently discarded while requests are paused, which is
+  // acceptable since the server wouldn't accept them anyway.
+  switch (response.status) {
+    case 401: // Unauthorized, i.e. this API key is invalid
+      return true;
+    case 403: // Forbidden, i.e. this API key is blocked by the server
+      return true;
+    case 429: // Too Many Requests, i.e. this API key is currently being rate limited
+      return true;
+    case 500: // Internal Server Error; give the ReadMe server a chance to recover
+      return true;
+    case 503: // Service Unavailable; same thing
+      return true;
+    default:
+      return false;
+  }
+}
+
+function getLogIds(body: OutgoingLogBody | OutgoingLogBody[]): LogId {
   if (Array.isArray(body)) {
-    return body.map(value => value._id);
+    return body.map(value => value._id) as UUID[];
   }
 
   return body._id;
 }
 
-export function metricsAPICall(
-  readmeAPIKey: string,
-  body: OutgoingLogBody[],
-  fireAndForget = false
-): Promise<LogResponse> {
+export function metricsAPICall(readmeAPIKey: string, body: OutgoingLogBody[], options: Options): Promise<LogResponse> {
   const signal = timeoutSignal(config.timeout);
   const encodedKey = Buffer.from(`${readmeAPIKey}:`).toString('base64');
 
   const makeRequest = () => {
+    if (backoffExpiresAt) {
+      if (backoffExpiresAt > new Date()) {
+        return Promise.resolve(undefined);
+      }
+      // after the backoff expires, erase the old expiration time
+      backoffExpiresAt = undefined;
+    }
+    logger.verbose({ message: 'Making a POST request to a service...', args: { body } });
     return fetch(new URL('/v1/request', config.host), {
       method: 'post',
       body: JSON.stringify(body),
@@ -66,15 +110,30 @@ export function metricsAPICall(
         'Content-Type': 'application/json',
         'User-Agent': `${pkg.name}/${pkg.version}`,
       },
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      // @ts-ignore
       signal,
-    }).finally(() => {
-      timeoutSignal.clear(signal);
-    });
+    })
+      .then(response => {
+        if (shouldBackoff(response)) {
+          // backoff for a few seconds, but not if another callback has already started backing off
+          if (!backoffExpiresAt) {
+            backoffExpiresAt = new Date();
+            backoffExpiresAt.setSeconds(backoffExpiresAt.getSeconds() + BACKOFF_SECONDS);
+          }
+        }
+        const logLevel = response.ok ? 'info' : 'error';
+        logger[logLevel]({ message: `Service responded with status ${response.status}: ${response.statusText}.` });
+        return response;
+      })
+      .finally(() => {
+        timeoutSignal.clear(signal);
+      });
   };
 
-  if (fireAndForget) {
+  if (options.fireAndForget) {
     makeRequest();
-    return Promise.resolve({
+    return Promise.resolve<LogResponse>({
       ids: getLogIds(body),
     });
   }
@@ -85,28 +144,4 @@ export function metricsAPICall(
       ids: getLogIds(body),
     };
   });
-}
-
-/**
- * Log a request to the API Metrics Dashboard with the standard Node.js server data.
- *
- * @param readmeAPIKey The API key for your ReadMe project. This ensures your requests end up in your dashboard. You can read more about the API key in [our docs](https://docs.readme.com/reference/authentication).
- * @param req A Node.js `IncomingMessage` object, usually found in your server's request handler.
- * @param res A Node.js `ServerResponse` object, usually found in your server's request handler.
- * @param payloadData A collection of information that will be logged alongside this request. See [Payload Data](#payload-data) for more details.
- * @param logOptions Additional options. Check the documentation for more details.
- *
- * @returns A promise that resolves to an object containing your log ids and the server response
- */
-export function log(
-  readmeAPIKey: string,
-  req: IncomingMessage,
-  res: ServerResponse,
-  payloadData: PayloadData,
-  logOptions: LogOptions
-) {
-  if (!readmeAPIKey) throw new Error('You must provide your ReadMe API key');
-
-  const payload = constructPayload(req, res, payloadData, logOptions);
-  return metricsAPICall(readmeAPIKey, Array.isArray(payload) ? payload : [payload], logOptions.fireAndForget);
 }

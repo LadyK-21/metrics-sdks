@@ -2,69 +2,42 @@
 
 namespace ReadMe;
 
-use Closure;
 use Composer\Factory;
+use Composer\InstalledVersions;
 use GuzzleHttp\Client;
 use GuzzleHttp\Handler\CurlMultiHandler;
 use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Exception\ClientException;
-use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Arr;
-use PackageVersions\Versions;
 use Ramsey\Uuid\Uuid;
-use Symfony\Component\HttpFoundation\HeaderBag;
+use ReadMe\HAR\Payload;
 use Symfony\Component\HttpFoundation\Response;
-use Symfony\Component\Mime\MimeTypes;
 
 class Metrics
 {
     protected const PACKAGE_NAME = 'readme/metrics';
-    protected const METRICS_API = 'https://metrics.readme.io';
-    protected const README_API = 'https://dash.readme.io';
+    protected const METRICS_SERVER = 'https://metrics.readme.io';
+    protected const README_API = 'https://dash.readme.com';
 
-    /** @var string */
-    private $api_key;
+    private bool $development_mode = false;
+    private array $denylist = [];
+    private array $allowlist = [];
+    private string|null $base_log_url = null;
 
-    /** @var bool */
-    private $development_mode = false;
+    private CurlMultiHandler $curl_handler;
+    private Client $client;
+    private Client $readme_api_client;
 
-    /** @var array */
-    private $denylist = [];
-
-    /** @var array */
-    private $allowlist = [];
-
-    /** @var string|null */
-    private $base_log_url = null;
-
-    /** @var class-string */
-    private $group_handler;
-
-    /** @var CurlMultiHandler */
-    private $curl_handler;
-
-    /** @var Client */
-    private $client;
-
-    /** @var Client */
-    private $readme_api_client;
-
-    /** @var string */
-    private $package_version;
-
-    /** @var string */
-    private $cache_dir;
-
-    /** @var string */
-    private $user_agent;
+    private string|null $package_version;
+    private string|null $cache_dir;
+    private string $user_agent;
 
     /**
      * @param string $api_key
      * @param class-string $group_handler
      * @param array $options
      */
-    public function __construct(string $api_key, string $group_handler, array $options = [])
+    public function __construct(public string $api_key, public string $group_handler, array $options = [])
     {
         $this->api_key = base64_encode($api_key . ':');
         $this->group_handler = $group_handler;
@@ -97,7 +70,7 @@ class Metrics
         $this->curl_handler = new CurlMultiHandler();
         $this->client = (isset($options['client'])) ? $options['client'] : new Client([
             'handler' => HandlerStack::create($this->curl_handler),
-            'base_uri' => self::METRICS_API,
+            'base_uri' => env('README_METRICS_SERVER', self::METRICS_SERVER),
             'timeout' => $curl_timeout,
         ]);
 
@@ -106,23 +79,24 @@ class Metrics
             'timeout' => $curl_timeout,
         ]);
 
-        /** @psalm-suppress DeprecatedClass */
-        $this->package_version = Versions::getVersion(self::PACKAGE_NAME);
-        $this->cache_dir = Factory::createConfig()->get('cache-dir');
+        $this->package_version = InstalledVersions::getVersion(self::PACKAGE_NAME);
+        $this->cache_dir = null;
 
-        $this->user_agent = 'readme-metrics-php/' . $this->package_version;
+        $this->user_agent = 'readme-metrics-php/' . ($this->package_version ?? 'unknown');
     }
 
     /**
      * @todo Handle bad token 401 errors?
      * @todo Change this to a queueing model like in readme-node?
-     * @param Request $request
-     * @param Response $response
      * @throws MetricsException
      */
-    public function track(Request $request, &$response): void
+    public function track(Request $request, Response &$response): void
     {
-        if (empty($this->base_log_url)) {
+        if ($request->getMethod() === 'OPTIONS') {
+            return;
+        }
+
+        if ($this->base_log_url === null || $this->base_log_url === '') {
             $this->base_log_url = $this->getProjectBaseUrl();
         }
 
@@ -132,7 +106,7 @@ class Metrics
             $response->headers->set('x-documentation-url', $this->base_log_url . '/logs/' . $log_id);
         }
 
-        $payload = $this->constructPayload($log_id, $request, $response);
+        $payload = (new Payload($this))->create($log_id, $request, $response);
 
         $headers = [
             'Authorization' => 'Basic ' . $this->api_key,
@@ -142,7 +116,7 @@ class Metrics
         // If not in development mode, all requests should be async.
         if (!$this->development_mode) {
             try {
-                $promise = $this->client->postAsync('/request', [
+                $promise = $this->client->postAsync('/v1/request', [
                     'headers' => $headers,
                     'json' => [$payload]
                 ]);
@@ -153,13 +127,15 @@ class Metrics
                 // resolve the promise we set up, but since we just want this to be a fire and forget request, we don't
                 // actually care about the response coming back from the Metrics API and all exceptions here can be
                 // discarded.
+                //
+                // @todo we should log this somewhere
             }
 
             return;
         }
 
         try {
-            $metrics_response = $this->client->post('/request', [
+            $metrics_response = $this->client->post('/v1/request', [
                 'headers' => $headers,
                 'json' => [$payload]
             ]);
@@ -180,137 +156,17 @@ class Metrics
             return;
         }
 
+        /** @psalm-suppress PossiblyInvalidArgument */
         $ex = new MetricsException(str_replace($json->_message, $json->name, $json->message));
         $ex->setErrors((array)$json->errors);
         throw $ex;
     }
 
-    /**
-     * @param string $log_id
-     * @param Request $request
-     * @param Response $response
-     * @return array
-     */
-    public function constructPayload(string $log_id, Request $request, $response): array
-    {
-        $request_start = defined('LARAVEL_START') ? LARAVEL_START : $_SERVER['REQUEST_TIME_FLOAT'];
-        $group = $this->group_handler::constructGroup($request);
-
-        $api_key_exists = array_key_exists('api_key', $group);
-        $id_key_exists = array_key_exists('id', $group);
-        if (!$api_key_exists and !$id_key_exists) {
-            throw new \TypeError('Metrics grouping function did not return an array with an api_key present.');
-        } elseif ($id_key_exists and empty($group['id'])) {
-            throw new \TypeError('Metrics grouping function must not return an empty id.');
-        } elseif ($api_key_exists and empty($group['api_key'])) {
-            throw new \TypeError('Metrics grouping function must not return an empty api_key.');
-        }
-
-        if ($api_key_exists) {
-            // Swap externally documented api_key field into backwards compatible & internally used id field
-            $group['id'] = $group['api_key'];
-            unset($group['api_key']);
-        }
-
-        return [
-            '_id' => $log_id,
-            'group' => $group,
-            'clientIPAddress' => $request->ip(),
-            'development' => $this->development_mode,
-            'request' => [
-                'log' => [
-                    'creator' => [
-                        'name' => self::PACKAGE_NAME,
-                        'version' => $this->package_version,
-                        'comment' => PHP_OS_FAMILY . '/php v' . PHP_VERSION
-                    ],
-                    'entries' => [
-                        [
-                            'pageref' => $request->url(),
-                            'startedDateTime' => date('c', (int) $request_start),
-                            'time' => (int) ((microtime(true) - $request_start) * 1000),
-                            'request' => $this->processRequest($request),
-                            'response' => $this->processResponse($response)
-                        ]
-                    ]
-                ]
-            ]
-        ];
-    }
-
-    /**
-     * @psalm-suppress TaintedInput
-     */
-    private function processRequest(Request $request): array
-    {
-        /**
-         * Since Laravel (currently as of 6.8.0) dumps $_GET and $_POST into `->query` and `->request` instead of
-         * putting $_GET into only `->query` and $_POST` into `->request`, we have no easy way way to dump only POST
-         * data into `postData`. So because of that, we're eschewing that and manually reconstructing our potential
-         * POST payload into an array here.
-         *
-         * @var array $params
-         */
-        $params = array_replace_recursive($_POST, $_FILES);
-        if (!empty($this->denylist)) {
-            $params = $this->excludeDataFromDenylist($params);
-        } elseif (!empty($this->allowlist)) {
-            $params = $this->excludeDataNotInAllowlist($params);
-        }
-
-        return [
-            'method' => $request->method(),
-            'url' => $request->fullUrl(),
-            'httpVersion' => $_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1',
-            'headers' => static::convertHeaderBagToArray($request->headers),
-            'queryString' => static::convertObjectToArray($_GET),
-            'postData' => [
-                'mimeType' => 'application/json',
-                'params' => static::convertObjectToArray($params)
-            ]
-        ];
-    }
-
-    /**
-     * @param Response $response
-     * @return array
-     */
-    private function processResponse($response): array
-    {
-        if ($response instanceof JsonResponse) {
-            $body = $response->getData(true);
-
-            if (!empty($this->denylist)) {
-                $body = $this->excludeDataFromDenylist($body);
-            } elseif (!empty($this->allowlist)) {
-                $body = $this->excludeDataNotInAllowlist($body);
-            }
-        } else {
-            /** @psalm-suppress ReservedWord */
-            $body = $response->getContent();
-        }
-
-        $status_code = $response->getStatusCode();
-
-        return [
-            'status' => $status_code,
-            'statusText' => isset(Response::$statusTexts[$status_code])
-                ? Response::$statusTexts[$status_code]
-                : 'Unknown status',
-            'headers' => static::convertHeaderBagToArray($response->headers),
-            'content' => [
-                'text' => (is_scalar($body)) ? $body : json_encode($body),
-                'size' => $response->headers->get('Content-Length', '0'),
-                'mimeType' => $response->headers->get('Content-Type')
-            ]
-        ];
-    }
 
     /**
      * Make an API request to ReadMe to retrieve the base log URL that'll be used to populate the `x-documentation-url`
      * header.
      *
-     * @return string|null
      */
     private function getProjectBaseUrl(): ?string
     {
@@ -382,7 +238,6 @@ class Metrics
     /**
      * Retrieve the cache file that'll be used to store the base URL for the `x-documentation-url` header.
      *
-     * @return string
      */
     public function getCacheFile(): string
     {
@@ -397,126 +252,39 @@ class Metrics
         // Replace potentially unsafe characters in the cache key so it can be safely used as a filename on the server.
         $cache_key = str_replace([DIRECTORY_SEPARATOR, '@'], '-', $cache_key);
 
-        return $this->cache_dir . DIRECTORY_SEPARATOR . $cache_key;
+        return $this->getCacheDir() . DIRECTORY_SEPARATOR . $cache_key;
     }
 
     /**
-     * Convert a HeaderBag into an acceptable nested array for the Metrics API.
+     * Retrieve the cache dir where the cache file will be stored.
      *
-     * @param HeaderBag $headers
-     * @return array
      */
-    protected static function convertHeaderBagToArray(HeaderBag $headers): array
+    public function getCacheDir(): string
     {
-        $output = [];
-        foreach ($headers->all() as $name => $values) {
-            /** @psalm-suppress PossiblyNullIterator */
-            foreach ($values as $value) {
-                // If the header is empty, don't worry about it.
-                if ($value === '') {
-                    continue; // @codeCoverageIgnore
-                }
-
-                $output[] = [
-                    'name' => $name,
-                    'value' => $value
-                ];
-            }
+        if ($this->cache_dir === null) {
+            $this->cache_dir = Factory::createConfig()->get('cache-dir');
         }
 
-        return $output;
+        return $this->cache_dir;
     }
 
-    /**
-     * Convert a key/value object-style array into an acceptable nested array for the Metrics API.
-     *
-     * @param array $input
-     * @return array
-     * @psalm-suppress PossiblyUndefinedArrayOffset
-     */
-    protected static function convertObjectToArray(array $input): array
+    public function getPackageVersion(): ?string
     {
-        return array_map(function ($key) use ($input) {
-            if (isset($input[$key]['tmp_name'])) {
-                $file = $input[$key];
-                return [
-                    'name' => $key,
-                    'value' => file_get_contents($file['tmp_name']),
-                    'fileName' => $file['name'],
-                    'contentType' => MimeTypes::getDefault()->guessMimeType($file['tmp_name'])
-                ];
-            }
-
-            return [
-                'name' => $key,
-                'value' => (is_scalar($input[$key])) ? $input[$key] : json_encode($input[$key])
-            ];
-        }, array_keys($input));
+        return $this->package_version;
     }
 
-    /**
-     * Given an array, exclude data at the highest associative level of it based upon the configured allowlist.
-     *
-     * @param array $data
-     * @return array
-     */
-    private function excludeDataFromDenylist($data = []): array
+    public function isInDevelopmentMode(): bool
     {
-        // If `$data` is an array with associative keys, let's run the denylist against that, otherwise run the
-        // denylist against the keys inside the top-level array.
-        if ($this->isArrayAssoc($data)) {
-            Arr::forget($data, $this->denylist);
-            return $data;
-        }
-
-        foreach ($data as $k => $v) {
-            Arr::forget($data[$k], $this->denylist);
-        }
-
-        return $data;
+        return $this->development_mode;
     }
 
-    /**
-     * Given an array, return only data at the highest level of it that matches the configured allowlist.
-     *
-     * @param array $data
-     * @return array
-     */
-    private function excludeDataNotInAllowlist($data = []): array
+    public function getDenylist(): array
     {
-        $ret = [];
-
-        // If `$data` is an array with associative keys, let's run the allowlist against that, otherwise run the
-        // allowlist against the keys inside the top-level array.
-        if ($this->isArrayAssoc($data)) {
-            foreach ($this->allowlist as $key) {
-                if (isset($data[$key])) {
-                    $ret[$key] = $data[$key];
-                }
-            }
-
-            return $ret;
-        }
-
-        foreach ($data as $idx => $v) {
-            foreach ($this->allowlist as $key) {
-                if (isset($v[$key])) {
-                    $ret[$idx][$key] = $data[$idx][$key];
-                }
-            }
-        }
-
-        return $ret;
+        return $this->denylist;
     }
 
-    /**
-     * Return whether or not a given array is associative.
-     *
-     * @param array $array
-     * @return bool
-     */
-    private function isArrayAssoc($array = []): bool
+    public function getAllowlist(): array
     {
-        return count(array_filter(array_keys($array), 'is_string')) > 0;
+        return $this->allowlist;
     }
 }

@@ -1,8 +1,30 @@
 name: nodejs
 
-on: [push]
+on:
+  push:
+    branches:
+      - main
+  pull_request:
 
 jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci --ignore-scripts
+      - run: make test-metrics-node-express
+      - run: make test-metrics-node-hapi
+      - run: make test-metrics-node-fastify
+      - run: make test-webhooks-node-express
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down
+
   build:
     runs-on: ubuntu-latest
     defaults:
@@ -10,36 +32,31 @@ jobs:
         working-directory: packages/node
 
     strategy:
+      fail-fast: false
       matrix:
         node-version:
-          - 14
-          - 16
-          - 18
+          - lts/-1
+          - lts/*
+          - latest
 
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-
-      # Node 14 still ships with npm@6 so for compatibility reasons we're upping
-      # this to match everything else.
-      - name: Install npm@8
-        if: matrix.node-version == '14'
-        run: npm install -g npm@8
 
       - run: npm ci --ignore-scripts
       - run: npm test
 
-  integration:
+  # This is being run separately since it's not playing nicely with Node 14.
+  # Once we drop Node 14 support we can probably consolidate this again.
+  lint:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/node
 
     steps:
-    - uses: actions/checkout@v3
-
-    - run: docker-compose run integration_node_express
-    - run: docker-compose run integration_node_hapi
-
-    - name: Cleanup
-      if: always()
-      run: docker-compose down
+      - uses: actions/checkout@v4
+      - run: npm ci --ignore-scripts
+      - run: npm run lint

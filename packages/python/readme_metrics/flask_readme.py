@@ -27,8 +27,11 @@ class ReadMeMetrics:
         app.after_request(self.after_request)
 
     def before_request(self):
+        if request.method == "OPTIONS":
+            return
+
         try:
-            request.rm_start_dt = str(datetime.utcnow())
+            request.rm_start_dt = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
             request.rm_start_ts = int(time.time() * 1000)
             if "Content-Length" in request.headers or request.data:
                 request.rm_content_length = request.headers["Content-Length"] or "0"
@@ -52,5 +55,5 @@ class ReadMeMetrics:
             # Errors in the Metrics SDK should never cause the application to
             # throw an error. Log it but don't re-raise.
             self.config.LOGGER.exception(e)
-        finally:
-            return response
+
+        return response
